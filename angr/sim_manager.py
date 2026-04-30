@@ -10,7 +10,7 @@ from types import TracebackType
 import claripy
 import mulpyplexer
 
-from .exploration_techniques import ExplorationTechnique, Veritesting, Threading, Explorer, Suggestions
+from .exploration_techniques import ExplorationTechnique, Veritesting, Threading, Explorer, Suggestions, BatchThreading
 from .misc.hookset import HookSet
 from .misc.ux import once
 from .misc.picklable_lock import PicklableLock
@@ -134,8 +134,13 @@ class SimulationManager:
         kwargs.pop("veritesting_options", {})
 
         threads = kwargs.pop("threads", None)
+        threading_mode = kwargs.pop("threading_mode", "old")
         if threads is not None:
-            self.use_technique(Threading(threads))
+            if threading_mode == "new":
+                self.use_technique(BatchThreading(threads))
+            else:
+                self.use_technique(Threading(threads))
+
 
         if kwargs:
             raise TypeError("Unexpected keyword arguments: " + " ".join(kwargs))
