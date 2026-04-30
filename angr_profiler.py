@@ -24,6 +24,7 @@ import textwrap
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
+from angr.exploration_techniques import Explorer
 
 # ── third-party ──────────────────────────────────────────────────────────────
 try:
@@ -34,10 +35,10 @@ except ImportError as exc:
     sys.exit(f"[!] Missing dependency: {exc}\n    pip install angr")
 
 # silence angr's verbose logging unless the user sets ANGR_LOG=1
-if not __import__("os").environ.get("ANGR_LOG"):
-    logging.getLogger("angr").setLevel(logging.ERROR)
-    logging.getLogger("cle").setLevel(logging.ERROR)
-    logging.getLogger("claripy").setLevel(logging.ERROR)
+#if not __import__("os").environ.get("ANGR_LOG"):
+logging.getLogger("angr").setLevel(logging.INFO)
+#    logging.getLogger("cle").setLevel(logging.ERROR)
+#    logging.getLogger("claripy").setLevel(logging.ERROR)
 
 # ── colour helpers ────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
@@ -309,7 +310,9 @@ def explore_paths(
         state.solver.add(sv >= -0x8000)
         state.solver.add(sv <=  0x7FFF)
 
-    simgr = proj.factory.simulation_manager(state, save_unsat=False)
+    simgr = proj.factory.simulation_manager(state, save_unsat=False, threads=16, threading_mode="new", techniques=[Explorer()])
+
+    print(simgr._techniques)
 
     info(f"Symbolic args : {n_args}  ×  32-bit BVS")
     info(f"Find  addrs   : {[hex(a) for a in (find_addrs  or [])]}")
