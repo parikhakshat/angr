@@ -7,6 +7,7 @@ from .loop_seer import LoopSeer
 from .tracer import Tracer
 from .explorer import Explorer
 from .threading import Threading
+from .batch_threading import BatchThreading
 from .dfs import DFS
 from .lengthlimiter import LengthLimiter
 from .veritesting import Veritesting
@@ -45,6 +46,7 @@ __all__ = (
     "StubStasher",
     "Suggestions",
     "TechniqueBuilder",
+    "BatchThreading",
     "Threading",
     "Timeout",
     "Tracer",
