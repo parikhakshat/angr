@@ -6,10 +6,10 @@ import contextlib
 import os
 import struct
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import angr
+from angr.exploration_techniques import BatchThreading
 
 MAIN_START = 0x4009D4
 MAIN_END = 0x00400C18
@@ -69,11 +69,7 @@ def load_trace():
     return res, delay_slots
 
 
-def _step_state(project, state, num_inst):
-    return project.factory.successors(state, num_inst=num_inst).successors
-
-
-def main(batch_size=64):
+def main():
     phases = []
     trace_log, delay_slots = load_trace()
 
@@ -90,44 +86,49 @@ def main(batch_size=64):
             auto_load_libs=False,
         )
 
-    state = project.factory.blank_state(addr=MAIN_START)
-    state.memory.store(FLAG_LOCATION, state.solver.BVS("flag", 8 * 32))
-    state.memory.store(FLAG_PTR_LOCATION, struct.pack("<I", FLAG_LOCATION))
-    choices = [state]
+    seed = project.factory.blank_state(addr=MAIN_START)
+    seed.memory.store(FLAG_LOCATION, seed.solver.BVS("flag", 8 * 32))
+    seed.memory.store(FLAG_PTR_LOCATION, struct.pack("<I", FLAG_LOCATION))
+
     workers = max(2, min(8, (os.cpu_count() or 2)))
+
+    choices = [seed]
 
     print("Tracing...")
     with profile("Path exploration", phases):
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            pending_jobs = []
-            for i, addr in enumerate(trace_log):
-                if addr in delay_slots:
-                    continue
+        for i, addr in enumerate(trace_log):
+            if addr in delay_slots:
+                continue
 
-                for s in choices:
-                    if s.addr == addr:
-                        break
-                else:
-                    raise ValueError("couldn't advance to %08x, line %d" % (addr, i + 1))
+            matching = [s for s in choices if s.addr == addr]
+            if not matching:
+                raise ValueError("couldn't advance to %08x, line %d" % (addr, i + 1))
 
-                if s.addr == MAIN_END:
-                    break
+            state = matching[0]
+            if state.addr == MAIN_END:
+                break
 
-                num_inst = 2 if (s.addr + 4) in delay_slots else 1
-                pending_jobs.append(pool.submit(_step_state, project, s, num_inst))
+            num_inst = 2 if (state.addr + 4) in delay_slots else 1
+            if len(matching) == 1:
+                choices = project.factory.successors(state, num_inst=num_inst).successors
+                continue
 
-                if len(pending_jobs) >= batch_size:
-                    choices = list(pending_jobs[-1].result())
-                    pending_jobs = []
-                else:
-                    choices = list(pending_jobs[-1].result())
+            # Keep original trace semantics; only parallelize when there are
+            # multiple trace-matching states to step.
+            simgr = project.factory.simulation_manager(None, save_unsat=False)
+            simgr.stashes["active"] = matching
+            simgr.use_technique(BatchThreading(threads=workers, task_multiplier=4))
+            simgr.step(num_inst=num_inst)
+            choices = simgr.active
 
-    state = s
+        state = choices[0]
 
     print("Running solver...")
     with profile("Constraint solving", phases):
         solution = (
-            state.solver.eval(state.memory.load(FLAG_LOCATION, 32), cast_to=bytes)
+            state.solver.eval(
+                state.memory.load(FLAG_LOCATION, 32), cast_to=bytes
+            )
             .rstrip(b"\0")
             .decode("ascii")
         )
