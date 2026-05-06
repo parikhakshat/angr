@@ -11,66 +11,181 @@ l = logging.getLogger(__name__)
 
 class BatchThreading(ExplorationTechnique):
     """
-    Enable multithreading.
+    Multithreaded symbolic execution via batched parallel stepping.
 
-    This is only useful in paths where a lot of time is taken inside z3, doing constraint solving.
-    This is because of python's GIL, which says that only one thread at a time may be executing python code.
+    States in the active stash are grouped into equal-sized batches and stepped
+    concurrently across a thread pool.  This is beneficial when stepping involves
+    z3 constraint solving because z3 releases the Python GIL, enabling true CPU
+    parallelism across OS threads.
+
+    Unlike Threading (one state per thread), BatchThreading groups multiple states
+    per task to reduce per-task scheduler overhead when the active state set is
+    large.  Setting task_multiplier > 1 creates more tasks than threads, which acts
+    as a work-stealing queue: a thread that finishes its batch early picks up the
+    next task rather than sitting idle waiting for a slow batch.
+
+    Pipelining: a persistent _pending set carries unfinished futures across step()
+    calls.  On each entry to step(), already-completed futures are harvested first,
+    then new batches are submitted.  This overlaps the main-thread absorb work with
+    the executor running the next round of batches.
     """
 
-    def __init__(self, threads=8, local_stash="thread_local"):
+    def __init__(
+        self,
+        threads=8,
+        local_stash="thread_local",
+        task_multiplier=4,
+        dedupe_key=None,
+        drop_deduped=False,
+        wait_timeout=0.1,
+    ):
+        """
+        :param threads:         Number of worker threads.
+        :param local_stash:     Name of the per-batch stash used inside each worker simgr.
+        :param task_multiplier: Tasks submitted per thread.  Values > 1 give work-stealing
+                                behaviour and improve load balance when step times vary.
+        :param dedupe_key:      Optional callable(state) -> hashable.  States that map to
+                                the same key are deduplicated before stepping.  Default None
+                                keeps every state (correct for general exploration).
+        :param drop_deduped:    When True and dedupe_key is set, remove the duplicates that
+                                were not chosen for stepping from the stash.
+        """
         super().__init__()
-        self.threads = threads
-        self.tasks = set()
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=threads)
+        self.threads = max(1, int(threads))
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.threads)
         self.local_stash = local_stash
+        self.task_multiplier = max(1, int(task_multiplier))
+        self.dedupe_key = dedupe_key
+        self.drop_deduped = drop_deduped
+        self.wait_timeout = wait_timeout
+
+        # Persistent across step() calls.
+        # _pending: futures submitted but not yet harvested.
+        # _queued:  ids of states currently in-flight, excluded from re-submission.
+        self._pending: set[concurrent.futures.Future] = set()
+        self._queued: set[int] = set()
+
+    # ------------------------------------------------------------------
+    # ExplorationTechnique interface
+    # ------------------------------------------------------------------
 
     def step(self, simgr, stash="active", error_list=None, target_stash=None, **kwargs):
         target_stash = target_stash or stash
         if error_list is not None:
-            raise ValueError("Can't pass error_list to step with threading enabled. Did you install threading twice?")
+            raise ValueError(
+                "Can't pass error_list to step with threading enabled. "
+                "Did you install threading twice?"
+            )
 
-        l.info("Thread-stepping %s of %s", stash, simgr)
-        simgr_stash = []
-        simgr_set = set()
-        for state in simgr.stashes[stash]:
-            if state.ip not in simgr_set:
-                simgr_set.add(state.ip)
-                simgr_stash.append(state)
-        l.info("Number of states in stash %s", len(simgr_stash))
+        l.info("BatchThreading stepping %s of %s", stash, simgr)
 
-        states_per_thread = math.ceil(len(simgr_stash) / self.threads)
+        # Harvest any futures that finished since the last step() call.
+        self._harvest(simgr, stash, block=False)
 
-        for i in range(0, len(simgr_stash), states_per_thread):
-            local_stash = simgr_stash[i:i+states_per_thread]
+        # Exclude states already in-flight from this round.
+        candidates = [s for s in simgr.stashes[stash] if id(s) not in self._queued]
+
+        # Optional deduplication: only step one representative per key.
+        dropped_keys: set = set()
+        if self.dedupe_key is not None:
+            seen: dict = {}
+            deduped = []
+            for state in candidates:
+                key = self.dedupe_key(state)
+                if key in seen:
+                    dropped_keys.add(key)
+                    continue
+                seen[key] = True
+                deduped.append(state)
+            candidates = deduped
+
+        if not candidates:
+            # Nothing new to submit; drain any remaining pending futures.
+            if self._pending:
+                self._harvest(simgr, stash, block=True)
+            return simgr
+
+        l.info(
+            "Submitting %d states to thread pool (%d threads, task_multiplier=%d)",
+            len(candidates),
+            self.threads,
+            self.task_multiplier,
+        )
+
+        # Split candidates into at most (threads * task_multiplier) batches.
+        # More batches than threads = work-stealing: idle threads pick up extras.
+        max_tasks = min(len(candidates), self.threads * self.task_multiplier)
+        states_per_task = math.ceil(len(candidates) / max_tasks)
+
+        for i in range(0, len(candidates), states_per_task):
+            batch = tuple(candidates[i : i + states_per_task])
             tsimgr = simgr.copy()
-            tsimgr._stashes = {self.local_stash: local_stash}
+            tsimgr._stashes = {self.local_stash: list(batch)}
             tsimgr._errored = []
-            self.tasks.add(self.executor.submit(self.inner_step, tuple(local_stash), tsimgr, target_stash=target_stash, **kwargs))
+            fut = self.executor.submit(
+                self._step_batch, batch, tsimgr, target_stash=target_stash, **kwargs
+            )
+            self._pending.add(fut)
+            self._queued.update(id(s) for s in batch)
 
-        timeout = None
-        while True:
-            done, self.tasks = concurrent.futures.wait(
-                self.tasks, timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED
+        # Block until all submitted futures (including from prior steps) complete.
+        # This keeps the stash fully consistent on return.
+        self._harvest(simgr, stash, block=True)
+
+        # Optionally discard duplicate originals that were skipped during dedupe.
+        if self.drop_deduped and dropped_keys:
+            simgr.stashes[stash] = [
+                s
+                for s in simgr.stashes[stash]
+                if self.dedupe_key(s) not in dropped_keys
+            ]
+
+        return simgr
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _step_batch(self, prev_batch, simgr, **kwargs):
+        error_list = []
+        simgr.step(stash=self.local_stash, error_list=error_list, **kwargs)
+        return prev_batch, error_list, simgr
+
+    def _harvest(self, simgr, stash: str, *, block: bool) -> None:
+        """
+        Collect finished futures and merge their results back into simgr.
+
+        When block=True, waits until self._pending is fully drained.
+        When block=False, only collects futures that are already done.
+        """
+        if not self._pending:
+            return
+
+        timeout = self.wait_timeout if block else 0
+        stepped_ids: set[int] = set()
+
+        while self._pending:
+            done, self._pending = concurrent.futures.wait(
+                self._pending,
+                timeout=timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED,
             )
             if not done:
                 break
 
-            for done_future in done:
-                done_future: concurrent.futures.Future
-                prev_stash, error_list, tsimgr = done_future.result()
+            for fut in done:
+                prev_batch, worker_errors, tsimgr = fut.result()
                 simgr.absorb(tsimgr)
-                simgr.errored.extend(error_list)
-                curr_stashes = {}
-                for state in simgr.stashes[stash]:
-                    curr_stashes[state.ip] = state
-                for state in prev_stash:
-                    if state.ip in curr_stashes:
-                        simgr.stashes[stash].remove(curr_stashes[state.ip])
+                simgr.errored.extend(worker_errors)
+                ids = {id(s) for s in prev_batch}
+                stepped_ids.update(ids)
+                self._queued.difference_update(ids)
+
+            # After the first completion, poll without blocking so we drain
+            # whatever else finished in the meantime before returning.
             timeout = 0
 
-        return simgr
-
-    def inner_step(self, prev_stash, simgr, **kwargs):
-        error_list = []
-        simgr.step(stash=self.local_stash, error_list=error_list, **kwargs)
-        return prev_stash, error_list, simgr
+        if stepped_ids:
+            simgr.stashes[stash] = [
+                s for s in simgr.stashes[stash] if id(s) not in stepped_ids
+            ]
