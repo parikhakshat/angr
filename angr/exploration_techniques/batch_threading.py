@@ -25,9 +25,10 @@ class BatchThreading(ExplorationTechnique):
     next task rather than sitting idle waiting for a slow batch.
 
     Pipelining: a persistent _pending set carries unfinished futures across step()
-    calls.  On each entry to step(), already-completed futures are harvested first,
-    then new batches are submitted.  This overlaps the main-thread absorb work with
-    the executor running the next round of batches.
+    calls. On each entry to step(), already-completed futures are harvested first,
+    then new batches are submitted, and the method returns without waiting for all
+    outstanding work to finish. This allows newly-ready states to keep advancing
+    while slower batches from prior rounds are still in flight.
     """
 
     def __init__(
@@ -100,9 +101,8 @@ class BatchThreading(ExplorationTechnique):
             candidates = deduped
 
         if not candidates:
-            # Nothing new to submit; drain any remaining pending futures.
-            if self._pending:
-                self._harvest(simgr, stash, block=True)
+            # Nothing new to submit this round. Keep any unfinished futures alive;
+            # they will be harvested in future step() calls.
             return simgr
 
         l.info(
@@ -128,9 +128,9 @@ class BatchThreading(ExplorationTechnique):
             self._pending.add(fut)
             self._queued.update(id(s) for s in batch)
 
-        # Block until all submitted futures (including from prior steps) complete.
-        # This keeps the stash fully consistent on return.
-        self._harvest(simgr, stash, block=True)
+        # Do not force a barrier here: leave unfinished futures pending so the
+        # next step() call can overlap newer work with slower older batches.
+        self._harvest(simgr, stash, block=False)
 
         # Optionally discard duplicate originals that were skipped during dedupe.
         if self.drop_deduped and dropped_keys:
