@@ -39,6 +39,7 @@ class BatchThreading(ExplorationTechnique):
         dedupe_key=None,
         drop_deduped=False,
         wait_timeout=0.1,
+        pipeline=True,
     ):
         """
         :param threads:         Number of worker threads.
@@ -59,6 +60,7 @@ class BatchThreading(ExplorationTechnique):
         self.dedupe_key = dedupe_key
         self.drop_deduped = drop_deduped
         self.wait_timeout = wait_timeout
+        self.should_block = not pipeline
 
         # Persistent across step() calls.
         # _pending: futures submitted but not yet harvested.
@@ -101,6 +103,8 @@ class BatchThreading(ExplorationTechnique):
             candidates = deduped
 
         if not candidates:
+            if self.should_block and self._pending:
+                self._harvest(simgr, stash, block=True)
             # Nothing new to submit this round. Keep any unfinished futures alive;
             # they will be harvested in future step() calls.
             return simgr
@@ -130,7 +134,7 @@ class BatchThreading(ExplorationTechnique):
 
         # Do not force a barrier here: leave unfinished futures pending so the
         # next step() call can overlap newer work with slower older batches.
-        self._harvest(simgr, stash, block=False)
+        self._harvest(simgr, stash, block=self.should_block)
 
         # Optionally discard duplicate originals that were skipped during dedupe.
         if self.drop_deduped and dropped_keys:
