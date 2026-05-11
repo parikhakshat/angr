@@ -174,8 +174,11 @@ class Server:
             # should be enough for at least one child process to start
             time.sleep(3)
 
-            i = 0
-            while not self.stopped or self.active_workers > 0:
+            # Loop until shutdown is requested and workers have drained, or every worker
+            # process has exited. The old condition `not stopped or active_workers > 0`
+            # never became false when exploration finished without a caller invoking
+            # stop() (stopped=False, active_workers=0), which hung the server forever.
+            while True:
                 server_state["stopped"] = self.stopped
                 time.sleep(1)
 
@@ -183,6 +186,14 @@ class Server:
                     with self._worker_exit_args_lock:
                         for _, args in self._worker_exit_args.items():
                             self._worker_exit_callback(*args)
+
+                workers_finished = len(self._workers) > 0 and all(
+                    w._proc is not None and not w._proc.is_alive() for w in self._workers
+                )
+                if self.stopped and self.active_workers == 0:
+                    break
+                if workers_finished and self.active_workers == 0:
+                    break
 
             server_state["stopped"] = self.stopped
             for worker in self._workers:
