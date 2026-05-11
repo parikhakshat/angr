@@ -3,6 +3,39 @@ from angr import engines
 from angr.errors import SimError, AngrError, AngrExplorationTechniqueError
 
 
+class _ConstantAddrCondition:
+    """Picklable replacement for a closure that always returns the same value."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value):
+        self._value = value
+
+    def __call__(self, state):
+        return self._value
+
+
+class _StaticAddrsCondition:
+    """Picklable replacement for the nested function used for int/set/list/tuple find/avoid."""
+
+    __slots__ = ("_addrs",)
+
+    def __init__(self, addrs):
+        self._addrs = frozenset(addrs)
+
+    def __call__(self, state):
+        if state.addr in self._addrs:
+            return {state.addr}
+
+        if not isinstance(state.project.factory.default_engine, engines.vex.VEXLifter):
+            return False
+
+        try:
+            return self._addrs.intersection(set(state.block().instruction_addrs))
+        except (AngrError, SimError):
+            return False
+
+
 def condition_to_lambda(condition, default=False):
     """
     Translates an integer, set, list or function into a lambda that checks if state's current basic block matches
@@ -16,10 +49,7 @@ def condition_to_lambda(condition, default=False):
                         at, or None if no addresses were provided statically.
     """
     if condition is None:
-
-        def condition_function(state):
-            return default
-
+        condition_function = _ConstantAddrCondition(default)
         static_addrs = set()
 
     elif isinstance(condition, int):
@@ -27,23 +57,7 @@ def condition_to_lambda(condition, default=False):
 
     elif isinstance(condition, (tuple, set, list)):
         static_addrs = set(condition)
-
-        def condition_function(state):
-            if state.addr in static_addrs:
-                # returning {state.addr} instead of True to properly handle find/avoid conflicts
-                return {state.addr}
-
-            if not isinstance(state.project.factory.default_engine, engines.vex.VEXLifter):
-                return False
-
-            try:
-                # If the address is not in the set (which could mean it is
-                # not at the top of a block), check directly in the blocks
-                # (Blocks are repeatedly created for every check, but with
-                # the IRSB cache in angr lifter it should be OK.)
-                return static_addrs.intersection(set(state.block().instruction_addrs))
-            except (AngrError, SimError):
-                return False
+        condition_function = _StaticAddrsCondition(static_addrs)
 
     elif callable(condition):
         condition_function = condition
