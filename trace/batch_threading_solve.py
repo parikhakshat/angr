@@ -2,6 +2,7 @@
 
 from __future__ import print_function
 
+import argparse
 import contextlib
 import os
 import struct
@@ -10,6 +11,8 @@ from dataclasses import dataclass
 
 import angr
 from angr.exploration_techniques import BatchThreading
+
+from exploration_technique_logging import configure_exploration_technique_debug, trace_solve_debug_enabled
 
 MAIN_START = 0x4009D4
 MAIN_END = 0x00400C18
@@ -117,7 +120,7 @@ def main():
             # multiple trace-matching states to step.
             simgr = project.factory.simulation_manager(None, save_unsat=False)
             simgr.stashes["active"] = matching
-            simgr.use_technique(BatchThreading(threads=workers, task_multiplier=4))
+            simgr.use_technique(BatchThreading(threads=workers, task_multiplier=1))
             simgr.step(num_inst=num_inst)
             choices = simgr.active
 
@@ -141,6 +144,15 @@ def test():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Trace-guided solve with angr BatchThreading.")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log Threading / BatchThreading exploration technique diagnostics to stderr "
+        "(or set TRACE_SOLVE_DEBUG=1).",
+    )
+    args = parser.parse_args()
+    configure_exploration_technique_debug(args.debug or trace_solve_debug_enabled())
     started = time.time()
     result, phase_data = main()
     elapsed = time.time() - started
