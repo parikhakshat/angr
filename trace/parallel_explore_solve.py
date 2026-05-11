@@ -2,6 +2,7 @@
 
 from __future__ import print_function
 
+import argparse
 import contextlib
 import os
 import struct
@@ -12,11 +13,26 @@ import importlib.util
 
 import angr
 
+from exploration_technique_logging import configure_exploration_technique_debug, trace_solve_debug_enabled
+
 MAIN_START = 0x4009D4
 MAIN_END = 0x00400C18
 
 FLAG_LOCATION = 0x400D80
 FLAG_PTR_LOCATION = 0x410EA0
+
+ENGINE_PATH = "./data.bin"
+# Shared by local Project load and angr/parallel_explore helpers (distributed + multiprocessing).
+PROJECT_KWARGS = {
+    "load_options": {
+        "main_opts": {
+            "backend": "blob",
+            "base_addr": 0x400770,
+            "arch": "mipsel",
+        },
+    },
+    "auto_load_libs": False,
+}
 
 
 @dataclass
@@ -83,17 +99,7 @@ def main():
     trace_log, delay_slots = load_trace()
 
     with profile("Binary loading", phases):
-        project = angr.Project(
-            "./data.bin",
-            load_options={
-                "main_opts": {
-                    "backend": "blob",
-                    "base_addr": 0x400770,
-                    "arch": "mipsel",
-                },
-            },
-            auto_load_libs=False,
-        )
+        project = angr.Project(ENGINE_PATH, **PROJECT_KWARGS)
 
     state = project.factory.blank_state(addr=MAIN_START)
     state.memory.store(FLAG_LOCATION, state.solver.BVS("flag", 8 * 32))
@@ -102,31 +108,36 @@ def main():
     workers = max(2, min(8, (os.cpu_count() or 2)))
 
     print("Tracing...")
-    with profile("Path exploration", phases):
-        # Use the helper from angr/parallel_explore.py for a coarse parallel
-        # reachability warmup, then keep exact trace-guided state semantics.
-        helper = _load_parallel_helper()
-        helper.run_multiprocess_explore(
-            binary_path=os.path.abspath("./data.bin"),
+    helper = _load_parallel_helper()
+    abs_engine = os.path.abspath(ENGINE_PATH)
+
+    with profile("Distributed server reachability", phases):
+        helper.run_distributed_server(
+            binary_path=abs_engine,
+            find_addrs=[MAIN_END],
+            avoid_addrs=[],
+            num_find=1,
+            max_workers=workers,
+            max_states=10,
+            staging_max=10,
+            project_kwargs=PROJECT_KWARGS,
+        )
+
+    with profile("Multiprocessing explore warmup", phases):
+        helper.run_multiprocessing_explore(
+            binary_path=abs_engine,
             find_addrs=[MAIN_END],
             avoid_addrs=[],
             num_processes=workers,
             warmup_steps=4,
             max_steps=200,
             num_find=1,
-            project_kwargs={
-                "load_options": {
-                    "main_opts": {
-                        "backend": "blob",
-                        "base_addr": 0x400770,
-                        "arch": "mipsel",
-                    }
-                },
-                "auto_load_libs": False,
-            },
+            project_kwargs=PROJECT_KWARGS,
+            join_timeout=120,
         )
 
-        # Keep trace-guided semantics for exact state recovery and flag solving.
+    with profile("Trace-guided stepping", phases):
+        # Exact trace-guided semantics for state recovery and flag solving.
         for i, addr in enumerate(trace_log):
             if addr in delay_slots:
                 continue
@@ -158,6 +169,17 @@ def test():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Trace-guided solve with distributed-server and multiprocessing warmups via angr/parallel_explore.py."
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log Threading / BatchThreading exploration technique diagnostics to stderr "
+        "(or set TRACE_SOLVE_DEBUG=1) if those techniques are used.",
+    )
+    args = parser.parse_args()
+    configure_exploration_technique_debug(args.debug or trace_solve_debug_enabled())
     started = time.time()
     result, phase_data = main()
     elapsed = time.time() - started
